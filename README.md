@@ -1,48 +1,50 @@
 # AI Investment Research Agent
 
-An AI-powered research tool that takes a company name or ticker, fetches financial data and news, and returns a structured **Invest / Pass** verdict backed by Groq/Llama reasoning.
+> **Live demo:** [https://investment-agent-flax.vercel.app/](https://investment-agent-flax.vercel.app/)
+
+Enter a company name or stock ticker. The agent fetches financial data and recent news, then returns a clear **Invest** or **Pass** verdict with reasoning.
+
+---
+
+## How it works
+
+1. You type a company name (e.g. "Apple") or ticker (e.g. "AAPL")
+2. The server resolves it to a ticker symbol via Alpha Vantage
+3. A 3-step AI pipeline runs:
+   - **Fetch** — pulls financial statements + news articles
+   - **Sentiment** — scores the news Bullish / Bearish / Neutral
+   - **Decision** — synthesizes everything into an Invest or Pass verdict
+4. Results appear in the dashboard
 
 ## Stack
 
-| Layer | Technology |
-|---|---|
-| Frontend | React + Vite + Tailwind |
-| Backend | Node.js + Express |
-| AI Pipeline | LangGraph (fetchData → analyzeSentiment → makeDecision) |
-| LLM | Groq · llama-3.3-70b-versatile |
-| Financial data | Alpha Vantage (OVERVIEW, INCOME_STATEMENT, BALANCE_SHEET, CASH_FLOW, EARNINGS) |
-| News | NewsAPI |
+- **Frontend** — React + Vite + Tailwind
+- **Backend** — Node.js + Express
+- **AI** — LangGraph pipeline · Groq (llama-3.3-70b)
+- **Data** — Alpha Vantage (financials) · NewsAPI (news)
 
 ## Running locally
 
 ```bash
-# Terminal 1 — backend (port 3001)
-cd server && npm run dev
+# Backend (port 3001)
+cd server
+cp .env.example .env   # fill in your API keys
+npm run dev
 
-# Terminal 2 — frontend (port 5173)
-cd client && npm run dev
+# Frontend (port 5173)
+cd client
+npm run dev
 ```
 
-Copy `server/.env.example` to `server/.env` and fill in your API keys.
+## API Keys needed
+
+| Key | Where to get |
+|---|---|
+| `GROQ_API_KEY` | [console.groq.com](https://console.groq.com) |
+| `ALPHA_VANTAGE_API_KEY` | [alphavantage.co](https://www.alphavantage.co/support/#api-key) |
+| `NEWS_API_KEY` | [newsapi.org](https://newsapi.org) |
 
 ## Known limitations
 
-### Ticker coverage — US equities only
-
-The financial fundamentals pipeline uses Alpha Vantage's `OVERVIEW`, `INCOME_STATEMENT`, `BALANCE_SHEET`, `CASH_FLOW`, and `EARNINGS` endpoints. **These endpoints only return data for US-listed equities (NYSE and NASDAQ).** Non-US exchanges are not covered.
-
-| Exchange | Status |
-|---|---|
-| NYSE / NASDAQ (e.g. `AAPL`, `TSLA`) | ✅ Supported |
-| BSE / NSE Indian stocks (e.g. `RELIANCE.BSE`) | ❌ Returns empty `{}` — not covered |
-| LSE, TSX, ASX, etc. | ❌ Not covered by OVERVIEW/fundamentals |
-
-If you search for a non-US ticker, the app will return a clear error message rather than producing a misleading verdict based on empty data.
-
-**How Alpha Vantage signals "no data":** It returns an empty JSON object `{}` with HTTP 200. This is distinct from a rate-limit response (which returns `{ "Information": "..." }`) and from an API error (which returns `{ "Error Message": "..." }`). All three cases are handled explicitly in `services/alphaVantage.js`.
-
-### Free-tier rate limits
-
-Alpha Vantage's free tier allows **25 requests per day** and 5 per minute. Each full research run fires 5 fundamentals calls (OVERVIEW + 4 statements), so you can run approximately 5 full analyses per day before hitting the daily cap. The server throttles to 12 seconds between calls to stay within the per-minute limit.
-
-If the daily limit is reached, the app returns a clear error message with instructions to wait until the next day or upgrade the API key.
+- **US stocks only** — Alpha Vantage fundamentals (OVERVIEW, income statement, etc.) only cover NYSE and NASDAQ. Non-US tickers (BSE, NSE, LSE, etc.) will return a clear error rather than a bad verdict.
+- **25 requests/day** — Alpha Vantage free tier allows 25 API calls per day (~5 full research runs). The app will tell you when the limit is hit.
