@@ -1,18 +1,16 @@
-export function buildFinancialSummaryPrompt({ ticker, companyName, financialSnapshot }) {
-	return `You are a senior equity research analyst.
-Write one concise paragraph summarizing the financial picture for ${companyName || ticker} (${ticker}).
-
-Rules:
-- Use only the numbers and facts in the provided data.
-- Do not invent missing metrics.
-- Focus on revenue growth, margins, valuation, leverage, and cash generation.
-- Mention if data is incomplete.
-
-Data:
-${financialSnapshot}
-
-Return plain text only. No bullets, no markdown, no JSON.`;
-}
+/**
+ * prompts.js — LLM prompt templates.
+ *
+ * Two prompts:
+ *   buildSentimentPrompt  — asks the LLM to score a batch of news articles as
+ *                           Bullish/Bearish/Neutral and return structured JSON.
+ *   buildDecisionPrompt   — asks the LLM to make a final Invest/Pass verdict
+ *                           given financial metrics and the sentiment analysis.
+ *
+ * Each function takes an object of named inputs and returns a string ready to
+ * pass as the `userPrompt` in callGroq(). The schema comments show exactly what
+ * JSON structure the LLM is expected to return.
+ */
 
 export function buildSentimentPrompt({ ticker, companyName, articles }) {
 	return `You are a market news analyst.
@@ -40,7 +38,7 @@ Schema:
 }`;
 }
 
-export function buildDecisionPrompt({ ticker, companyName, financialSummary, financialSnapshot, sentimentAnalysis, newsArticles }) {
+export function buildDecisionPrompt({ ticker, companyName, financialSnapshot, sentimentAnalysis, newsArticles }) {
 	return `You are a disciplined portfolio manager.
 Decide whether to Invest or Pass on ${companyName || ticker} (${ticker}).
 
@@ -49,9 +47,6 @@ Rules:
 - Avoid hallucinations and do not mention data you cannot see.
 - If evidence is mixed or incomplete, choose Pass.
 - Output valid JSON only.
-
-Financial summary:
-${financialSummary}
 
 Financial snapshot:
 ${financialSnapshot}
@@ -70,9 +65,3 @@ Schema:
 	"keyFactors": ["factor 1", "factor 2", "factor 3"]
 }`;
 }
-
-export default {
-	buildFinancialSummaryPrompt,
-	buildSentimentPrompt,
-	buildDecisionPrompt
-};

@@ -1,17 +1,33 @@
+/**
+ * graph.js — The LangGraph pipeline.
+ *
+ * This file defines the three-step AI workflow that runs for every research request:
+ *   1. fetchData    — Pulls financial statements from Alpha Vantage and news from NewsAPI.
+ *                     Normalises everything into a clean `financialSnapshot` object.
+ *   2. analyzeSentiment — Sends the news articles to Groq/Llama and gets back a
+ *                     structured sentiment object (score, label, themes, per-article labels).
+ *   3. makeDecision — Sends the financialSnapshot + sentiment to Groq and gets back
+ *                     the final { decision, confidence, reasoning, keyFactors } JSON.
+ *
+ * LangGraph runs steps 2 and 3 sequentially (sentiment must finish before decision).
+ * State flows through each node as a plain object — each node returns only the keys it sets.
+ */
+
 import { StateGraph, Annotation } from '@langchain/langgraph';
 import { ChatGroq } from '@langchain/groq';
-import { buildFinancialSummaryPrompt, buildSentimentPrompt, buildDecisionPrompt } from './prompts.js';
+import { buildSentimentPrompt, buildDecisionPrompt } from './prompts.js';
 import { fetchResearchData } from './tools.js';
 
 const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-specdec';
 
+// The shape of data that flows between nodes.
+// Each field starts as undefined and gets filled in as the pipeline runs.
 const StateAnnotation = Annotation.Root({
 	ticker: Annotation(),
 	companyName: Annotation(),
 	source: Annotation(),
 	financials: Annotation(),
 	financialSnapshot: Annotation(),
-	financialSummary: Annotation(),
 	news: Annotation(),
 	articleText: Annotation(),
 	newsSentiment: Annotation(),
@@ -20,6 +36,7 @@ const StateAnnotation = Annotation.Root({
 	error: Annotation()
 });
 
+// Strip ```json ... ``` fences that LLMs sometimes wrap their output in.
 function stripCodeFences(value) {
 	if (typeof value !== 'string') return value;
 	let cleaned = value.trim();
@@ -37,22 +54,14 @@ function safeJsonParse(value, fallback = null) {
 	}
 }
 
-function buildFinancialText(snapshot = {}) {
-	return JSON.stringify(snapshot, null, 2);
-}
-
+// Single helper for all Groq calls — creates the client, invokes, returns content string.
 async function callGroq({ systemPrompt, userPrompt, temperature = 0.2 }) {
 	const apiKey = process.env.GROQ_API_KEY;
 	if (!apiKey) {
 		throw new Error('GROQ_API_KEY is not defined.');
 	}
 
-	const model = new ChatGroq({
-		apiKey,
-		model: GROQ_MODEL,
-		temperature
-	});
-
+	const model = new ChatGroq({ apiKey, model: GROQ_MODEL, temperature });
 	const response = await model.invoke([
 		{ role: 'system', content: systemPrompt },
 		{ role: 'user', content: userPrompt }
@@ -62,10 +71,10 @@ async function callGroq({ systemPrompt, userPrompt, temperature = 0.2 }) {
 	if (!content) {
 		throw new Error('Groq response did not include message content.');
 	}
-
 	return content;
 }
 
+// --- Node 1: Fetch raw financial data and news, normalise into state fields ---
 async function fetchDataNode(state) {
 	const { ticker, companyName } = state;
 	try {
@@ -76,7 +85,17 @@ async function fetchDataNode(state) {
 			warnings: payload.warnings || []
 		};
 	} catch (error) {
-		console.error(`[fetchData] Failed for ${ticker}:`, error);
+		console.error(`[fetchData] Failed for ${ticker}:`, error.message);
+
+		// Propagate definitive failures (unsupported ticker, rate limit) so the
+		// route can return a clear error to the user instead of running the LLM
+		// on an empty dataset and producing a meaningless Pass/0% verdict.
+		if (error.message.includes('not available') || error.message.includes('request limit')) {
+			return { ...state, error: error.message };
+		}
+
+		// Genuine transient network failure — fall through to mock so at least
+		// news sentiment can still run and produce something useful.
 		return {
 			...state,
 			source: 'mock',
@@ -90,32 +109,7 @@ async function fetchDataNode(state) {
 	}
 }
 
-async function analyzeFinancialsNode(state) {
-	const financialText = buildFinancialText(state.financialSnapshot || {});
-	const systemPrompt = 'You summarize financial data for investment research. Be factual, concise, and do not invent missing data.';
-	const userPrompt = buildFinancialSummaryPrompt({
-		ticker: state.ticker,
-		companyName: state.companyName,
-		financialSnapshot: financialText
-	});
-
-	try {
-		const summary = await callGroq({
-			systemPrompt,
-			userPrompt,
-			temperature: 0.1
-		});
-
-		return {
-			financialSummary: summary.trim()
-		};
-	} catch (error) {
-		console.warn(`[analyzeFinancials] OpenAI summary failed for ${state.ticker}, using fallback text: ${error.message}`);
-		const fallback = `Financial data for ${state.companyName || state.ticker} is ${state.financialSnapshot?.peRatio ? `trading at a P/E of ${state.financialSnapshot.peRatio}` : 'incompletely available'}. Revenue growth, leverage, and free cash flow should be reviewed alongside the latest filings.`;
-		return { financialSummary: fallback };
-	}
-}
-
+// --- Node 2: Classify news sentiment (Bullish/Bearish/Neutral) via Groq ---
 async function analyzeSentimentNode(state) {
 	const systemPrompt = 'You analyze news sentiment for stocks. Stay grounded in the provided articles and output valid JSON only.';
 	const userPrompt = buildSentimentPrompt({
@@ -125,12 +119,7 @@ async function analyzeSentimentNode(state) {
 	});
 
 	try {
-		const raw = await callGroq({
-			systemPrompt,
-			userPrompt,
-			temperature: 0.1
-		});
-
+		const raw = await callGroq({ systemPrompt, userPrompt, temperature: 0.1 });
 		const parsed = safeJsonParse(raw, null);
 		if (!parsed) {
 			throw new Error('Unable to parse sentiment JSON.');
@@ -146,7 +135,8 @@ async function analyzeSentimentNode(state) {
 			}
 		};
 	} catch (error) {
-		console.warn(`[analyzeSentiment] OpenAI sentiment failed for ${state.ticker}, using fallback text: ${error.message}`);
+		// Fallback: simple keyword scoring so the pipeline never crashes
+		console.warn(`[analyzeSentiment] LLM call failed for ${state.ticker}, using keyword fallback: ${error.message}`);
 		const lowerCased = (state.articleText || '').toLowerCase();
 		const negativeHits = ['lawsuit', 'downgrade', 'miss', 'decline', 'weak', 'debt', 'cuts'];
 		const positiveHits = ['beat', 'upgrade', 'growth', 'record', 'profit', 'buyback', 'raised'];
@@ -159,42 +149,36 @@ async function analyzeSentimentNode(state) {
 			newsSentiment: {
 				overallScore: score,
 				overallLabel: label,
-				summary: 'Sentiment fallback was used because the LLM call failed.',
+				summary: 'Keyword-based sentiment fallback (LLM unavailable).',
 				keyThemes: [],
-				articleSentiments: (state.news || []).map((article) => ({
-					title: article.title,
-					label
-				}))
+				articleSentiments: (state.news || []).map((article) => ({ title: article.title, label }))
 			}
 		};
 	}
 }
 
+// --- Node 3: Combine financials + sentiment and produce the final Invest/Pass verdict ---
 async function makeDecisionNode(state) {
 	const systemPrompt = 'You are a strict investment decision engine. Output valid JSON only and avoid unsupported claims.';
 	const userPrompt = buildDecisionPrompt({
 		ticker: state.ticker,
 		companyName: state.companyName,
-		financialSummary: state.financialSummary || 'No financial summary available.',
-		financialSnapshot: buildFinancialText(state.financialSnapshot || {}),
+		financialSnapshot: JSON.stringify(state.financialSnapshot || {}, null, 2),
 		sentimentAnalysis: JSON.stringify(state.newsSentiment || {}, null, 2),
 		newsArticles: JSON.stringify((state.news || []).slice(0, 6), null, 2)
 	});
 
 	try {
-		const raw = await callGroq({
-			systemPrompt,
-			userPrompt,
-			temperature: 0.05
-		});
-
+		const raw = await callGroq({ systemPrompt, userPrompt, temperature: 0.05 });
 		const parsed = safeJsonParse(raw, null);
 		if (!parsed) {
 			throw new Error('Unable to parse decision JSON.');
 		}
 
 		const decision = String(parsed.decision || 'Pass').toLowerCase() === 'invest' ? 'Invest' : 'Pass';
-		const confidence = Number.isFinite(Number(parsed.confidence)) ? Math.max(0, Math.min(100, Number(parsed.confidence))) : 50;
+		const confidence = Number.isFinite(Number(parsed.confidence))
+			? Math.max(0, Math.min(100, Number(parsed.confidence)))
+			: 50;
 
 		return {
 			decision: {
@@ -205,17 +189,21 @@ async function makeDecisionNode(state) {
 			}
 		};
 	} catch (error) {
-		console.warn(`[makeDecision] OpenAI decision failed for ${state.ticker}, using heuristic fallback: ${error.message}`);
+		// Fallback: simple heuristic so the route always gets a usable decision object
+		console.warn(`[makeDecision] LLM call failed for ${state.ticker}, using heuristic fallback: ${error.message}`);
 		const sentimentScore = Number(state.newsSentiment?.overallScore ?? 50);
 		const peRatio = Number(state.financialSnapshot?.peRatio);
 		const revenueGrowth = Number(state.financialSnapshot?.revenueGrowthYoY);
-		const pass = (Number.isFinite(peRatio) && peRatio > 45) || sentimentScore < 45 || (Number.isFinite(revenueGrowth) && revenueGrowth < 0);
+		const pass =
+			(Number.isFinite(peRatio) && peRatio > 45) ||
+			sentimentScore < 45 ||
+			(Number.isFinite(revenueGrowth) && revenueGrowth < 0);
 
 		return {
 			decision: {
 				decision: pass ? 'Pass' : 'Invest',
 				confidence: pass ? 61 : 66,
-				reasoning: 'Fallback decision used because the model was unavailable. The heuristic weighs valuation, revenue trend, and news sentiment.',
+				reasoning: 'Heuristic fallback: LLM unavailable. Weights P/E, revenue trend, and news sentiment.',
 				keyFactors: [
 					`News sentiment score: ${sentimentScore}`,
 					`P/E ratio: ${Number.isFinite(peRatio) ? peRatio.toFixed(2) : 'N/A'}`,
@@ -226,27 +214,14 @@ async function makeDecisionNode(state) {
 	}
 }
 
+// Wire up the graph: fetch → sentiment → decision → done
 const workflow = new StateGraph(StateAnnotation)
 	.addNode('fetchData', fetchDataNode)
-	.addNode('analyzeFinancials', analyzeFinancialsNode)
 	.addNode('analyzeSentiment', analyzeSentimentNode)
 	.addNode('makeDecision', makeDecisionNode)
 	.addEdge('__start__', 'fetchData')
-	.addEdge('fetchData', 'analyzeFinancials')
 	.addEdge('fetchData', 'analyzeSentiment')
-	.addEdge('analyzeFinancials', 'makeDecision')
 	.addEdge('analyzeSentiment', 'makeDecision')
 	.addEdge('makeDecision', '__end__');
 
-const graph = workflow.compile();
-
-export {
-	graph,
-	StateAnnotation,
-	fetchDataNode as fetchData,
-	analyzeFinancialsNode as analyzeFinancials,
-	analyzeSentimentNode as analyzeSentiment,
-	makeDecisionNode as makeDecision
-};
-
-export default graph;
+export default workflow.compile();

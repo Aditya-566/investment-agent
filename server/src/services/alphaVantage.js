@@ -49,33 +49,45 @@ async function fetchWithRetry(url, params, retries = 3) {
         throw new Error('Empty response received from Alpha Vantage API');
       }
 
-      // Check for Note (rate limit warning on standard key) or Information
+      // Rate limit: free tier returns a { Note: "..." } or { Information: "..." } object.
       if (data.Note || data.Information) {
         const message = data.Note || data.Information;
-        console.warn(`[Alpha Vantage] Rate limit warning on attempt ${attempt}: ${message}`);
-        
+        console.warn(`[Alpha Vantage] Rate limit on attempt ${attempt}: ${message}`);
         if (attempt < retries) {
-          // Wait 30 seconds before retrying when rate limited
-          console.log(`[Alpha Vantage] Waiting 30 seconds before retrying...`);
+          console.log(`[Alpha Vantage] Waiting 30s before retry...`);
           await new Promise(resolve => setTimeout(resolve, 30000));
           continue;
-        } else {
-          throw new Error(`Alpha Vantage API rate limit hit: ${message}`);
         }
+        const err = new Error(`Alpha Vantage daily request limit reached. Try again tomorrow or upgrade your API key.`);
+        err.code = 'AV_RATE_LIMIT';
+        throw err;
       }
 
-      // Check for API error message
+      // Hard API error (invalid function name, bad param, etc.)
       if (data['Error Message']) {
-        throw new Error(`Alpha Vantage API Error: ${data['Error Message']}`);
+        const err = new Error(`Alpha Vantage API Error: ${data['Error Message']}`);
+        err.code = 'AV_API_ERROR';
+        throw err;
+      }
+
+      // Empty object {} — Alpha Vantage's silent signal for "no data for this ticker."
+      // This is what you get for non-US tickers (BSE/NSE) or delisted symbols on
+      // fundamentals endpoints (OVERVIEW, INCOME_STATEMENT, etc.).
+      if (Object.keys(data).length === 0) {
+        console.warn(`[Alpha Vantage] Empty response for ${params.function} / ${params.symbol || params.keywords} — ticker not covered by this endpoint.`);
+        const err = new Error(`No data returned for ${params.symbol || 'this ticker'} — it may be a non-US exchange or unsupported by the Alpha Vantage free tier.`);
+        err.code = 'AV_NO_DATA';
+        throw err;
       }
 
       return data;
     } catch (error) {
-      console.error(`[Alpha Vantage] Error during API call on attempt ${attempt}: ${error.message}`);
-      if (attempt === retries) {
+      // Don't retry our own typed errors — they are definitive, not transient.
+      if (error.code === 'AV_NO_DATA' || error.code === 'AV_API_ERROR' || error.code === 'AV_RATE_LIMIT') {
         throw error;
       }
-      // Wait 5 seconds before retrying general network errors
+      console.error(`[Alpha Vantage] Network error on attempt ${attempt}: ${error.message}`);
+      if (attempt === retries) throw error;
       await new Promise(resolve => setTimeout(resolve, 5000));
     }
   }
